@@ -4,10 +4,12 @@ import {
   NotFoundException,
   ForbiddenException,
   Logger,
+  BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../prisma/redis.service';
 import { ConfigService } from '@nestjs/config';
+import { MediaService } from '../media/media.service';
 import * as CryptoJS from 'crypto-js';
 import { SubscriptionStatus } from '../../common/types/subscription';
 
@@ -20,6 +22,7 @@ export class PromptsService {
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
     private readonly configService: ConfigService,
+    private readonly mediaService: MediaService,
   ) {
     this.encryptionKey = this.configService.get('encryption.key');
   }
@@ -125,6 +128,7 @@ export class PromptsService {
           imageAlt: true,
           isPremium: true,
           isActive: true,
+          creatorId: true,
           createdAt: true,
           updatedAt: true,
           creator: {
@@ -172,11 +176,12 @@ export class PromptsService {
     const encryptionKey = process.env.ENCRYPTION_KEY;
 
     const data = prompts.map((prompt: any) => {
+      const isCreator = userId && prompt.creator?.id === userId;
       const isPurchased =
         userPurchaseStatus[prompt.id] === 'COMPLETED' ||
         purchasedPromptIds.includes(prompt.id);
       const isFree = prompt.priceStars === 0;
-      const hasAccess = isPurchased || isFree || isSubscriber;
+      const hasAccess = isPurchased || isFree || isSubscriber || isCreator;
 
       let decryptedContent = null;
 
@@ -227,8 +232,14 @@ export class PromptsService {
 
   async findOne(id: string, userId?: string) {
     try {
-      const prompt = await this.prisma.prompt.findUnique({
-        where: { id, isActive: true },
+      const prompt = await this.prisma.prompt.findFirst({
+        where: {
+          id,
+          OR: [
+            { isActive: true },
+            userId ? { creatorId: userId } : {}
+          ]
+        },
         select: {
           id: true,
           slug: true,
@@ -245,8 +256,10 @@ export class PromptsService {
           imageAlt: true,
           isPremium: true,
           isActive: true,
+          creatorId: true,
           createdAt: true,
           updatedAt: true,
+          fullContent: true,
           creator: {
             select: {
               id: true,
@@ -262,15 +275,37 @@ export class PromptsService {
       }
 
       let hasAccess = false;
-      if (userId) {
+      if (prompt.priceStars === 0 || (userId && prompt.creatorId === userId)) {
+        hasAccess = true;
+      } else if (userId) {
         hasAccess = await this.checkUserAccess(userId, id);
+      }
+
+      const { fullContent, ...rest } = prompt;
+      let decryptedContent = undefined;
+
+      if (hasAccess && fullContent) {
+        if (prompt.priceStars > 0 && this.encryptionKey) {
+          try {
+            const bytes = CryptoJS.AES.decrypt(fullContent, this.encryptionKey);
+            const decrypted = bytes.toString(CryptoJS.enc.Utf8);
+            if (decrypted) {
+              decryptedContent = decrypted;
+            }
+          } catch (e) {
+            // Fallback if decryption fails
+          }
+        } else {
+          decryptedContent = fullContent;
+        }
       }
 
       return {
         success: true,
         data: {
-          ...prompt,
+          ...rest,
           hasAccess,
+          decryptedContent,
         },
       };
     } catch (error) {
@@ -280,56 +315,73 @@ export class PromptsService {
   }
 
   async getFullPrompt(userId: string, promptId: string) {
-    // Check cache first
-    const cacheKey = `user:${userId}:access:${promptId}`;
-    const cachedAccess = await this.redis.get(cacheKey);
-
-    if (cachedAccess !== 'true') {
-      let hasAccess = false;
-      // Check for active subscription
-      const user = await this.prisma.user.findUnique({
-        where: { id: userId },
-        select: { subscriptionStatus: true } as any,
-      });
-
-      if ((user as any)?.subscriptionStatus === SubscriptionStatus.ACTIVE) {
-        // Subscribers get access!
-        hasAccess = true;
-      } else {
-        // Check database for individual purchase
-        const purchase = await this.prisma.purchase.findFirst({
-          where: {
-            userId,
-            promptId,
-            status: 'COMPLETED',
-          },
-        });
-        hasAccess = !!purchase;
-      }
-
-      if (!hasAccess) {
-        throw new ForbiddenException('Subscription or Purchase required');
-      }
-
-      // Cache access for 24 hours
-      await this.redis.set(cacheKey, 'true', 60 * 60 * 24);
-    }
-
-    // Get encrypted prompt
+    // Get prompt first to check if it's free or if the user is the creator
     const prompt = await this.prisma.prompt.findUnique({
       where: { id: promptId },
-      select: { fullContent: true },
+      select: { fullContent: true, priceStars: true, creatorId: true },
     });
 
     if (!prompt) {
       throw new NotFoundException('Prompt not found');
     }
 
-    // Decrypt content
-    const decrypted = CryptoJS.AES.decrypt(
-      prompt.fullContent,
-      this.encryptionKey,
-    ).toString(CryptoJS.enc.Utf8);
+    const isFree = prompt.priceStars === 0;
+    const isCreator = prompt.creatorId === userId;
+
+    if (!isFree && !isCreator) {
+      // Check cache first for paid prompts
+      const cacheKey = `user:${userId}:access:${promptId}`;
+      const cachedAccess = await this.redis.get(cacheKey);
+
+      if (cachedAccess !== 'true') {
+        let hasAccess = false;
+        // Check for active subscription
+        const user = await this.prisma.user.findUnique({
+          where: { id: userId },
+          select: { subscriptionStatus: true } as any,
+        });
+
+        if ((user as any)?.subscriptionStatus === 'ACTIVE') {
+          // Subscribers get access!
+          hasAccess = true;
+        } else {
+          // Check database for individual purchase
+          const purchase = await this.prisma.purchase.findFirst({
+            where: {
+              userId,
+              promptId,
+              status: 'COMPLETED',
+            },
+          });
+          hasAccess = !!purchase;
+        }
+
+        if (!hasAccess) {
+          throw new ForbiddenException('Subscription or Purchase required');
+        }
+
+        // Cache access for 24 hours
+        await this.redis.set(cacheKey, 'true', 60 * 60 * 24);
+      }
+    }
+
+    // Decrypt content if premium
+    let finalContent = prompt.fullContent;
+    
+    if (!isFree && this.encryptionKey && prompt.fullContent) {
+      try {
+        const bytes = CryptoJS.AES.decrypt(
+          prompt.fullContent,
+          this.encryptionKey,
+        );
+        const decrypted = bytes.toString(CryptoJS.enc.Utf8);
+        if (decrypted) {
+          finalContent = decrypted;
+        }
+      } catch (e) {
+        // Fallback to plain text if decryption fails
+      }
+    }
 
     // Log access
     await this.redis.zincrby(
@@ -341,7 +393,7 @@ export class PromptsService {
     return {
       success: true,
       data: {
-        content: decrypted,
+        content: finalContent,
       },
     };
   }
@@ -604,6 +656,127 @@ export class PromptsService {
         limit,
         totalPages: Math.ceil(total / limit),
       },
+    };
+  }
+
+  async findCreated(userId: string) {
+    const prompts = await this.prisma.prompt.findMany({
+      where: { creatorId: userId },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        title: true,
+        slug: true,
+        description: true,
+        category: true,
+        priceStars: true,
+        imageUrl: true,
+        isActive: true,
+        createdAt: true,
+        purchaseCount: true,
+        purchases: {
+          where: { status: 'COMPLETED' },
+          select: {
+            paymentMethod: true,
+            amountPaid: true,
+            currency: true,
+          },
+        },
+      },
+    });
+
+    return {
+      success: true,
+      data: prompts,
+    };
+  }
+
+  async submitPrompt(data: {
+    title: string;
+    description: string;
+    category: string;
+    priceStars: number | string;
+    previewContent: string;
+    fullContent: string;
+    creatorId: string;
+    priceTon?: number | string;
+    priceLocal?: number | string;
+    imageFile?: Express.Multer.File;
+  }) {
+    // 1. Validate required fields
+    const requiredFields = [
+      'title',
+      'description',
+      'category',
+      'priceStars',
+      'fullContent',
+    ];
+    for (const field of requiredFields) {
+      if (!data[field as keyof typeof data]) {
+        throw new BadRequestException(`Field "${field}" is required`);
+      }
+    }
+
+    // 2. Parse numbers
+    const parseNumber = (val: string | number) => {
+      const parsed = typeof val === 'string' ? parseFloat(val) : val;
+      if (isNaN(parsed)) throw new BadRequestException(`Invalid number`);
+      return parsed;
+    };
+    
+    const priceStars = parseNumber(data.priceStars);
+    const priceTon = data.priceTon ? parseNumber(data.priceTon) : 0;
+    const priceLocal = data.priceLocal ? parseNumber(data.priceLocal) : 0;
+
+    // 3. Generate slug
+    const generateSlug = (title: string) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    let slug = generateSlug(data.title);
+
+    // Ensure slug uniqueness
+    const existing = await this.prisma.prompt.findUnique({ where: { slug } });
+    if (existing) {
+      slug = `${slug}-${Date.now().toString().slice(-4)}`;
+    }
+
+    // 4. Encrypt content
+    let encryptedContent = data.fullContent;
+    if (priceStars > 0 && this.encryptionKey) {
+      encryptedContent = CryptoJS.AES.encrypt(
+        data.fullContent,
+        this.encryptionKey,
+      ).toString();
+    }
+
+    // 5. Handle image upload
+    let imageUrl: string | null = null;
+    if (data.imageFile) {
+      const uploadResult = await this.mediaService.uploadFile(data.imageFile);
+      imageUrl = uploadResult.url;
+    }
+
+    // 6. Create prompt in DB with isActive = false
+    const prompt = await this.prisma.prompt.create({
+      data: {
+        title: data.title,
+        slug,
+        description: data.description,
+        category: data.category,
+        priceStars,
+        priceTon,
+        priceLocal,
+        previewContent: data.previewContent || '',
+        fullContent: encryptedContent,
+        creatorId: data.creatorId,
+        imageUrl,
+        imageAlt: data.title,
+        isActive: false, // Critical: Pending review
+      },
+    });
+
+    return {
+      success: true,
+      message: 'Prompt submitted for review',
+      data: { id: prompt.id, slug: prompt.slug },
     };
   }
 }
