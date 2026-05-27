@@ -97,8 +97,8 @@ async function bootstrap() {
   // Global prefix
   app.setGlobalPrefix('api');
 
-  const port = configService.get('PORT') || 4060;
-  await app.listen(port);
+  const port = process.env.PORT || configService.get<number>('PORT') || 8080;
+  await app.listen(port, '0.0.0.0');
 
   logger.log(`🚀 Server is running on: http://localhost:${port}`);
   logger.log(`📝 API available at: http://localhost:${port}/api`);
