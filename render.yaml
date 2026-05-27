@@ -26,5 +26,5 @@ services:
         sync: false
     plan: free
     region: oregon
-    healthCheckPath: /health
+    healthCheckPath: /api/health
     autoDeploy: true

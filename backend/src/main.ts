@@ -35,7 +35,9 @@ async function bootstrap() {
         allowedOrigins.indexOf(origin) !== -1 ||
         origin.includes('localhost') ||
         origin.includes('ngrok-free.dev') ||
-        origin.includes('loca.lt')
+        origin.includes('loca.lt') ||
+        origin.includes('vercel.app')
+
       ) {
         console.log(`CORS allowed origin: ${origin}`);
         callback(null, true);
