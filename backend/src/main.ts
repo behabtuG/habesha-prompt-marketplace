@@ -100,9 +100,10 @@ async function bootstrap() {
   const port = process.env.PORT || configService.get<number>('PORT') || 8080;
   await app.listen(port, '0.0.0.0');
 
-  logger.log(`🚀 Server is running on: http://localhost:${port}`);
-  logger.log(`📝 API available at: http://localhost:${port}/api`);
-  logger.log(`📁 Static files at: http://localhost:${port}/uploads/`);
-  logger.log(`🌐 CORS enabled for: ${frontendUrl}, ${ngrokUrl}`);
+  // Use the actual address Render assigns (host = 0.0.0.0, port = process.env.PORT)
+  logger.log(`🚀 Server is running on: http://0.0.0.0:${port}`);
+  logger.log(`📝 API available at: http://0.0.0.0:${port}/api`);
+  logger.log(`📁 Static files at: http://0.0.0.0:${port}/uploads/`);
+
 }
 bootstrap();
