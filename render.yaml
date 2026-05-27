@@ -4,8 +4,8 @@ services:
     runtime: node
     # Run all commands inside the backend subdirectory
     rootDir: backend
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: cd backend && npm install && npm run build
+    startCommand: cd backend && npm start
     envVars:
       - key: DATABASE_URL
         sync: false
